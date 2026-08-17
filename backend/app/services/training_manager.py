@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.config import BACKEND_DIR, CHECKPOINT_DIR, PRESETS, RunConfig, preset_config
-from app.engine.train import STATUS_FILENAME, STOP_FILENAME
+from app.engine.train import STATE_FILENAME, STATUS_FILENAME, STOP_FILENAME
 from app.engine.watch import (
     WatchSettings,
     read_settings,
@@ -35,6 +35,28 @@ from app.engine.watch import (
 from app.store.metrics import MetricsStore
 
 LOG_DIRNAME = "logs"
+
+STALE_AFTER_SECONDS = 30 * 60
+"""A run still marked 'running' whose ``status.json`` is older than this is
+almost certainly dead -- the process crashed, or the machine was rebooted. The
+threshold is generous because a single arena or benchmark phase on a large preset
+can run for a long time without touching the file."""
+
+
+def _deep_merge(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge one config section at a time.
+
+    A shallow merge would let ``{"selfplay": {"workers": 2}}`` wipe out the rest
+    of the preset's self-play block, so overrides descend into nested dicts.
+    """
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(current, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 @dataclass
@@ -54,7 +76,7 @@ class LaunchRequest:
             raise ValueError(f"unknown preset {self.preset!r}")
         config = preset_config(self.preset)
         if self.overrides:
-            config = RunConfig.from_dict({**config.to_dict(), **self.overrides})
+            config = RunConfig.from_dict(_deep_merge(config.to_dict(), self.overrides))
         if self.name:
             config.name = self.name
         if self.iterations:
@@ -120,11 +142,20 @@ class TrainingManager:
                 directory = CHECKPOINT_DIR / run_id
                 if not directory.exists():
                     raise ValueError(f"unknown run {run_id!r}")
+                if not (directory / "best.pt").exists():
+                    raise ValueError(
+                        f"run {run_id!r} has no checkpoint to resume from; "
+                        "start a new run instead"
+                    )
                 stop_flag = directory / STOP_FILENAME
                 if stop_flag.exists():
                     stop_flag.unlink()
-                command += ["--run-id", run_id, "--resume", "--config",
-                            str(directory / "config.json")]
+                command += ["--run-id", run_id, "--resume"]
+                # The run's own config is the only valid one: the network shape
+                # has to match the checkpoint being loaded.
+                stored_config = directory / "config.json"
+                if stored_config.exists():
+                    command += ["--config", str(stored_config)]
             else:
                 config_path = self._stage_config(config)
                 command += ["--config", str(config_path), "--name", config.name]
@@ -205,6 +236,23 @@ class TrainingManager:
 
     # -- reporting --------------------------------------------------------- #
 
+    def saved_state(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """What a future session would pick up: iteration, games, Elo, hours."""
+        path = CHECKPOINT_DIR / run_id / STATE_FILENAME
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    def _annotate(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        """Tell the UI whether this run can be continued, and from where."""
+        directory = CHECKPOINT_DIR / run["id"]
+        run["resumable"] = (directory / "best.pt").exists()
+        run["has_trainer_state"] = (directory / "trainer.pt").exists()
+        run["saved_state"] = self.saved_state(run["id"])
+        return run
+
     def status(self, run_id: Optional[str] = None) -> Dict[str, Any]:
         self._reconcile()
         run = (
@@ -222,6 +270,7 @@ class TrainingManager:
 
         phase = "idle"
         live: Dict[str, Any] = {}
+        age: Optional[float] = None
         status_file = CHECKPOINT_DIR / run["id"] / STATUS_FILENAME
         if status_file.exists():
             try:
@@ -229,12 +278,26 @@ class TrainingManager:
                 phase = live.get("phase", "idle")
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                age = max(0.0, time.time() - status_file.stat().st_mtime)
+            except OSError:
+                pass
 
+        active = run["status"] == "running"
+        process_alive = self.is_running and self._run_id == run["id"]
         last = self.store.last_iteration(run["id"])
         return {
-            "active": run["status"] == "running",
-            "process_alive": self.is_running and self._run_id == run["id"],
-            "run": run,
+            "active": active,
+            "process_alive": process_alive,
+            # A row left saying "running" by a crashed trainer would otherwise
+            # block the run from ever being resumed.
+            "stale": bool(
+                active
+                and not process_alive
+                and (age is None or age > STALE_AFTER_SECONDS)
+            ),
+            "status_age_seconds": None if age is None else round(age, 1),
+            "run": self._annotate(run),
             "phase": phase,
             "live": live,
             "last_iteration": last,
@@ -307,7 +370,7 @@ class TrainingManager:
         return self.store.events(run_id, limit=limit)
 
     def runs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        return self.store.list_runs(limit=limit)
+        return [self._annotate(run) for run in self.store.list_runs(limit=limit)]
 
 
 _MANAGER: Optional[TrainingManager] = None

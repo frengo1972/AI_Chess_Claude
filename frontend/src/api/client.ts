@@ -182,23 +182,86 @@ export const getDoc = (slug: string) =>
 
 // --------------------------------------------------------------- websocket
 
-function openSocket<T>(path: string, onMessage: (payload: T) => void): WebSocket {
+export interface SocketHandle {
+  close(): void
+}
+
+const RECONNECT_STEP_MS = 1000
+const RECONNECT_MAX_MS = 10_000
+
+/**
+ * A websocket that survives the API restarting, and closes politely.
+ *
+ * Two behaviours worth the extra code:
+ *
+ * * **Reconnect.** The API is a separate process and gets restarted often in
+ *   development (`uvicorn --reload`). Without this the dashboard goes quiet
+ *   until someone reloads the page.
+ * * **No aborted handshakes.** Calling `close()` on a socket that is still
+ *   `CONNECTING` tears down the TCP connection mid-handshake; the dev proxy then
+ *   logs `write ECONNABORTED`. StrictMode mounts every effect twice, so that is
+ *   the common case, not a rare one. Deferring the close to `onopen` avoids it.
+ */
+function openSocket<T>(path: string, onMessage: (payload: T) => void): SocketHandle {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const socket = new WebSocket(`${protocol}://${window.location.host}${BASE}${path}`)
-  socket.onmessage = (event) => {
-    try {
-      onMessage(JSON.parse(event.data) as T)
-    } catch {
-      /* ignore malformed frames */
+  const url = `${protocol}://${window.location.host}${BASE}${path}`
+
+  let socket: WebSocket | null = null
+  let retry: number | undefined
+  let attempt = 0
+  let disposed = false
+
+  const connect = () => {
+    if (disposed) return
+    const current = new WebSocket(url)
+    socket = current
+
+    current.onopen = () => {
+      attempt = 0
+      if (disposed) current.close()
+    }
+    current.onmessage = (event) => {
+      try {
+        onMessage(JSON.parse(event.data) as T)
+      } catch {
+        /* ignore malformed frames */
+      }
+    }
+    current.onclose = () => {
+      if (disposed || socket !== current) return
+      attempt += 1
+      retry = window.setTimeout(
+        connect,
+        Math.min(attempt * RECONNECT_STEP_MS, RECONNECT_MAX_MS),
+      )
     }
   }
-  return socket
+
+  connect()
+
+  return {
+    close() {
+      disposed = true
+      if (retry !== undefined) window.clearTimeout(retry)
+      const current = socket
+      socket = null
+      if (!current) return
+      current.onmessage = null
+      if (current.readyState === WebSocket.CONNECTING) {
+        current.onclose = null
+        current.onopen = () => current.close()
+        return
+      }
+      current.onclose = null
+      if (current.readyState === WebSocket.OPEN) current.close()
+    },
+  }
 }
 
 export function openTrainingSocket(
   onMessage: (status: TrainingStatus) => void,
   runId?: string,
-): WebSocket {
+): SocketHandle {
   return openSocket(`/training/ws${runId ? `?run_id=${runId}` : ''}`, onMessage)
 }
 
@@ -207,7 +270,7 @@ export function openWatchSocket(
   onMessage: (snapshot: WatchSnapshot) => void,
   runId?: string,
   intervalMs = 500,
-): WebSocket {
+): SocketHandle {
   const query = `?interval_ms=${intervalMs}${runId ? `&run_id=${runId}` : ''}`
   return openSocket(`/training/watch/ws${query}`, onMessage)
 }

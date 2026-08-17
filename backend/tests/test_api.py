@@ -44,6 +44,9 @@ def test_models_endpoint_always_offers_a_playable_network(client):
     ids = {model["id"] for model in payload["models"]}
     assert "untrained" in ids
     assert payload["default"] in ids
+    # A run directory also holds non-network .pt files (the optimiser state that
+    # makes a run resumable); offering those as opponents would crash the game.
+    assert not [model for model in ids if model.endswith(("/trainer", "/candidate"))]
 
 
 def test_new_game_returns_legal_moves(client):
@@ -171,6 +174,19 @@ def test_training_presets_expose_network_sizes(client):
 def test_training_status_is_safe_with_no_active_run(client):
     payload = client.get("/api/training/status").json()
     assert "active" in payload
+    assert "stale" in payload
+    if payload["run"]:
+        assert "resumable" in payload["run"]
+
+
+def test_resume_refuses_a_run_that_does_not_exist(client):
+    """No process should be spawned for a run with nothing to continue from."""
+    response = client.post(
+        "/api/training/start",
+        json={"preset": "tiny", "resume_run_id": "definitely-not-a-run"},
+    )
+    assert response.status_code == 409
+    assert "definitely-not-a-run" in response.json()["detail"]
 
 
 def test_watch_endpoint_is_safe_with_no_active_run(client):

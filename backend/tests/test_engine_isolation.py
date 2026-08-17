@@ -35,6 +35,7 @@ PLAYING_MODULES = [
     "selfplay.py",
     "arena.py",
     "watch.py",
+    "inference.py",
 ]
 
 FORBIDDEN_PREFIXES = ("chess.engine", "app.services", "stockfish")

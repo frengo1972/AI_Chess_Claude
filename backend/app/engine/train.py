@@ -13,9 +13,20 @@ One iteration is:
    monotone.
 4. **Record** -- KPIs go into SQLite so the dashboard can plot them.
 
+A run is meant to be **interrupted and picked up again**, possibly days later, so
+that a network keeps getting stronger across many sessions instead of starting
+from scratch each time. Everything needed for that lives in the run directory:
+
+* ``best.pt`` -- the champion, the only net that ever plays;
+* ``trainer.pt`` -- optimizer moments, LR schedule position and RNG state, the
+  parts that make iteration N+1 continue rather than restart;
+* ``state.json`` -- the human-readable counters (iteration, games, Elo, hours);
+* ``replay/iter-*.npz`` -- the recent data, so the buffer is not empty on restart.
+
 Run it directly::
 
     python -m app.engine.train --preset small --name myrun --iterations 40
+    python -m app.engine.train --run-id myrun-ab12cd34 --resume --iterations 40
 """
 
 from __future__ import annotations
@@ -49,6 +60,8 @@ from app.store.metrics import MetricsStore
 
 STOP_FILENAME = "stop.flag"
 STATUS_FILENAME = "status.json"
+STATE_FILENAME = "state.json"
+TRAINER_STATE_FILENAME = "trainer.pt"
 
 
 class TrainingRun:
@@ -89,17 +102,15 @@ class TrainingRun:
         self.games_total = 0
         self.positions_total = 0
         self.elo = 0.0
+        self.wall_seconds = 0.0
+        self.sessions = 0
+        self.resumed = False
 
         if resume and self.best_path.exists():
+            self.resumed = True
             self.model, info = load_checkpoint(self.best_path, device=self.device)
             self.start_iteration = int(info.get("iteration", 0))
-            state_file = self.directory / "state.json"
-            if state_file.exists():
-                state = json.loads(state_file.read_text(encoding="utf-8"))
-                self.start_iteration = int(state.get("iteration", self.start_iteration))
-                self.games_total = int(state.get("games_total", 0))
-                self.positions_total = int(state.get("positions_total", 0))
-                self.elo = float(state.get("elo", 0.0))
+            self._read_state_file()
             self.buffer.load_directory(self.replay_dir, limit_files=20)
         else:
             self.model = ChessNet(config.network).to(self.device)
@@ -122,6 +133,19 @@ class TrainingRun:
             network=self.model.describe(),
         )
 
+        if self.resumed:
+            self._restore_trainer_state()
+            self.sessions += 1
+            self.store.log(
+                self.run_id,
+                f"resumed at iteration {self.start_iteration} "
+                f"(session {self.sessions}, {self.games_total} games so far, "
+                f"Elo {self.elo:+.0f}, buffer {len(self.buffer)})",
+            )
+        else:
+            self.sessions = 1
+            (self.directory / TRAINER_STATE_FILENAME).unlink(missing_ok=True)
+
     # -- setup ------------------------------------------------------------- #
 
     def _prepare_watch(self, *, resume: bool) -> None:
@@ -141,6 +165,124 @@ class TrainingRun:
                     move_delay_ms=self.config.selfplay.watch_move_delay_ms,
                 ),
             )
+
+    # -- persistence ------------------------------------------------------- #
+
+    def _read_state_file(self) -> None:
+        state_file = self.directory / STATE_FILENAME
+        if not state_file.exists():
+            return
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        self.start_iteration = int(state.get("iteration", self.start_iteration))
+        self.games_total = int(state.get("games_total", 0))
+        self.positions_total = int(state.get("positions_total", 0))
+        self.elo = float(state.get("elo", 0.0))
+        self.wall_seconds = float(state.get("wall_seconds", 0.0))
+        self.sessions = int(state.get("sessions", 0))
+
+    def _restore_trainer_state(self) -> None:
+        """Continue the optimiser, the LR schedule and the RNG stream.
+
+        Without this a resumed run silently restarts three things: AdamW's
+        moments (a few hundred noisy steps to rebuild), the learning-rate
+        schedule (back to the initial, too-high rate late in a run) and the
+        random stream (the same self-play seeds, hence near-duplicate data).
+        """
+        path = self.directory / TRAINER_STATE_FILENAME
+        if not path.exists():
+            # Pre-``trainer.pt`` run, or one stopped before its first iteration
+            # completed: at least put the schedule where the iteration count says.
+            self._fast_forward_schedule(self.start_iteration)
+            self.store.log(
+                self.run_id,
+                "no trainer.pt found: optimizer restarted, learning rate "
+                f"fast-forwarded to iteration {self.start_iteration}",
+                level="warn",
+            )
+            return
+        try:
+            # Always to CPU: optimizer state is moved onto the parameters'
+            # device by load_state_dict, and torch's RNG state must stay a CPU
+            # byte tensor.
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            self.optimizer.load_state_dict(payload["optimizer"])
+            self.scheduler.load_state_dict(payload["scheduler"])
+            if payload.get("numpy_rng") is not None:
+                self.rng.bit_generator.state = payload["numpy_rng"]
+            if payload.get("torch_rng") is not None:
+                torch.set_rng_state(payload["torch_rng"].to(torch.uint8))
+        except Exception as error:  # noqa: BLE001 - a resume must never hard-fail
+            self.optimizer = self._build_optimizer()
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer,
+                milestones=list(self.config.train.lr_milestones),
+                gamma=self.config.train.lr_gamma,
+            )
+            self._fast_forward_schedule(self.start_iteration)
+            self.store.log(
+                self.run_id,
+                f"could not reuse trainer.pt ({error!r}); optimizer restarted",
+                level="warn",
+            )
+
+    def _fast_forward_schedule(self, iterations: int) -> None:
+        """Place the LR schedule at ``iterations`` without stepping it.
+
+        Stepping in a loop warns about running the scheduler ahead of the
+        optimizer; the multi-step schedule is a pure function of the epoch count,
+        so it is both quieter and exact to set it.
+        """
+        if iterations <= 0:
+            return
+        train = self.config.train
+        passed = sum(1 for milestone in train.lr_milestones if milestone <= iterations)
+        for group, base in zip(self.optimizer.param_groups, self.scheduler.base_lrs):
+            group["lr"] = base * (train.lr_gamma**passed)
+        self.scheduler.last_epoch = iterations
+
+    def _persist_state(self, iteration: int) -> None:
+        """Write everything a future session needs, at every iteration.
+
+        Called on the normal path *and* on the data-collection-only path, so a
+        run killed at any point resumes from the last completed iteration rather
+        than repeating it.
+        """
+        (self.directory / STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "run_id": self.run_id,
+                    "iteration": iteration,
+                    "games_total": self.games_total,
+                    "positions_total": self.positions_total,
+                    "elo": self.elo,
+                    "wall_seconds": round(self.wall_seconds, 1),
+                    "sessions": self.sessions,
+                    "device": self.device,
+                    "updated_at": time.time(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        target = self.directory / TRAINER_STATE_FILENAME
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        torch.save(
+            {
+                "format": 1,
+                "iteration": iteration,
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+                "numpy_rng": self.rng.bit_generator.state,
+                "torch_rng": torch.get_rng_state(),
+                "network_config": vars(self.config.network),
+            },
+            temporary,
+        )
+        temporary.replace(target)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         train = self.config.train
@@ -173,8 +315,14 @@ class TrainingRun:
             flag.unlink()
 
     def _write_status(self, payload: Dict) -> None:
+        """Publish the live phase, with a timestamp so readers can spot a dead run.
+
+        The API cannot see a trainer it did not start (after a reload, say), so the
+        freshness of this file is the only hint it has.
+        """
         (self.directory / STATUS_FILENAME).write_text(
-            json.dumps(payload, default=str), encoding="utf-8"
+            json.dumps({**payload, "updated_at": time.time()}, default=str),
+            encoding="utf-8",
         )
 
     # -- main loop --------------------------------------------------------- #
@@ -204,6 +352,7 @@ class TrainingRun:
 
     def _run_iteration(self, iteration: int) -> None:
         metrics: Dict[str, float] = {}
+        iteration_started = time.perf_counter()
         self._write_status(
             {"run_id": self.run_id, "iteration": iteration, "phase": "selfplay"}
         )
@@ -248,6 +397,11 @@ class TrainingRun:
                 "games_per_minute": summary.get("games_per_minute", 0.0),
                 "positions_per_second": len(samples) / max(selfplay_seconds, 1e-6),
                 "games_this_iteration": len(batch.games),
+                # How far the search was from the eventual result. Only the
+                # mixed target uses q, but the gap is worth watching either way.
+                "value_gap": summary.get("avg_value_gap", 0.0),
+                "value_search_weight": self._effective_value_weight(),
+                "sessions": self.sessions,
             }
         )
 
@@ -275,7 +429,15 @@ class TrainingRun:
             metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
             metrics["elo"] = self.elo
             metrics["train_seconds"] = 0.0
+            self.wall_seconds += time.perf_counter() - iteration_started
+            metrics["wall_seconds"] = self.wall_seconds
             self.store.record_iteration(self.run_id, iteration, metrics)
+            # Data-collection iterations count too: without this the next session
+            # would replay them.
+            self._persist_state(iteration)
+            self._write_status(
+                {"run_id": self.run_id, "iteration": iteration, "phase": "idle"}
+            )
             return
 
         train_started = time.perf_counter()
@@ -364,19 +526,9 @@ class TrainingRun:
             shutil.copyfile(self.best_path, generation)
             self._prune_generations()
 
-        (self.directory / "state.json").write_text(
-            json.dumps(
-                {
-                    "run_id": self.run_id,
-                    "iteration": iteration,
-                    "games_total": self.games_total,
-                    "positions_total": self.positions_total,
-                    "elo": self.elo,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        self.wall_seconds += time.perf_counter() - iteration_started
+        metrics["wall_seconds"] = self.wall_seconds
+        self._persist_state(iteration)
 
         self.store.record_iteration(self.run_id, iteration, metrics)
         self._write_status(
@@ -389,6 +541,12 @@ class TrainingRun:
         )
 
     # -- pieces ------------------------------------------------------------ #
+
+    def _effective_value_weight(self) -> float:
+        """The value-target mix actually in force, after the no-search rule."""
+        if self.config.search.simulations <= 1:
+            return 0.0
+        return min(max(self.config.train.value_search_weight, 0.0), 1.0)
 
     def _train_steps(self) -> Dict[str, float]:
         train = self.config.train
@@ -469,8 +627,13 @@ class TrainingRun:
 
 
 def build_config(args: argparse.Namespace) -> RunConfig:
+    stored = CHECKPOINT_DIR / args.run_id / "config.json" if args.run_id else None
     if args.config:
         config = RunConfig.from_json(Path(args.config))
+    elif args.resume and stored is not None and stored.exists():
+        # Resuming without naming a config: the run's own is the only right one,
+        # since the network shape has to match the checkpoint.
+        config = RunConfig.from_json(stored)
     else:
         config = preset_config(args.preset)
     if args.name:
@@ -510,6 +673,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"run id : {run.run_id}")
     print(f"device : {run.device}")
     print(f"network: {json.dumps(run.model.describe())}")
+    if run.resumed:
+        print(
+            f"resumed: iteration {run.start_iteration}, {run.games_total} games, "
+            f"Elo {run.elo:+.0f}, {run.wall_seconds / 3600:.1f} h so far"
+        )
     run.run()
     return 0
 

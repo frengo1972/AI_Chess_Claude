@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS iterations (
     promoted            INTEGER,
     benchmark_elo       REAL,
     benchmark_score     REAL,
+    value_gap           REAL,
+    wall_seconds        REAL,
     extra_json          TEXT,
     PRIMARY KEY (run_id, iteration)
 );
@@ -109,6 +111,8 @@ ITERATION_COLUMNS = [
     "promoted",
     "benchmark_elo",
     "benchmark_score",
+    "value_gap",
+    "wall_seconds",
 ]
 
 
@@ -118,6 +122,24 @@ class MetricsStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            self._add_missing_columns(connection)
+
+    @staticmethod
+    def _add_missing_columns(connection: sqlite3.Connection) -> None:
+        """Bring an older database up to the current KPI set.
+
+        ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already
+        exists, so a new KPI column would make every insert fail on any machine
+        that has trained before. Runs are long and their history is the point of
+        the project, so the columns are added in place rather than starting over.
+        """
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(iterations)").fetchall()
+        }
+        for column in ITERATION_COLUMNS:
+            if column not in existing:
+                connection.execute(f"ALTER TABLE iterations ADD COLUMN {column} REAL")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -145,12 +167,22 @@ class MetricsStore:
     ) -> None:
         now = time.time()
         with self._connect() as connection:
+            # A resumed run re-registers itself, so the row is upserted rather
+            # than replaced: ``created_at`` is when the network was born, and the
+            # preset it was born with does not change on resume.
             connection.execute(
                 """
-                INSERT OR REPLACE INTO runs
+                INSERT INTO runs
                     (id, name, preset, created_at, updated_at, status, config_json,
                      network_json, notes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name         = excluded.name,
+                    preset       = COALESCE(runs.preset, excluded.preset),
+                    updated_at   = excluded.updated_at,
+                    status       = excluded.status,
+                    config_json  = excluded.config_json,
+                    network_json = excluded.network_json
                 """,
                 (
                     run_id,

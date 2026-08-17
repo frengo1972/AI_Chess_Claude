@@ -20,8 +20,9 @@ forte.
 | **Regole** | delegate a `python-chess`: la rete non può nemmeno proporre una mossa illegale |
 | **Apprendimento** | self-play multiprocesso su CPU, backprop su GPU, gating in arena, KPI su SQLite |
 | **Interfaccia** | Vite + React, scacchiera a tutto schermo con drag & drop, statistiche sui bordi |
+| **Self-play in diretta** | le partite di addestramento su più scacchiere, rallentabili per seguirle a occhio |
 | **Assistenza** | valutazione e mosse migliori di Stockfish — **solo per l'umano**, verificato da test |
-| **Documentazione** | 11 pagine consultabili dall'app stessa (`/docs`) |
+| **Documentazione** | 12 pagine consultabili dall'app stessa (`/docs`) |
 
 ## Avvio rapido
 
@@ -68,6 +69,16 @@ python -m app.engine.train --preset small --name esperimento1 --iterations 60
 Preset disponibili: `tiny`, `small`, `medium`, `large`, `policy-only`. I checkpoint
 finiscono in `backend/checkpoints/<run-id>/`, i KPI in `backend/data/training.db`.
 
+Un run si può fermare e riprendere anche giorni dopo, accumulando forza nel tempo:
+il pulsante **Riprendi** della pagina Training, oppure
+
+```bash
+python -m app.engine.train --run-id small-ab12cd34 --resume --iterations 40
+```
+
+Riprendono insieme ai pesi anche l'ottimizzatore, il learning rate, il replay buffer e
+l'Elo accumulato — [perché conta](docs/06-apprendimento.md).
+
 ## Il vincolo centrale
 
 La barra di valutazione e i suggerimenti servono all'**essere umano**, per poter giocare
@@ -93,6 +104,7 @@ Dettagli in [`docs/08-isolamento-stockfish.md`](docs/08-isolamento-stockfish.md)
 | [09 API](docs/09-api.md) | riferimento HTTP |
 | [10 Avvio](docs/10-avvio.md) | installazione, uso, problemi frequenti |
 | [11 Riferimenti](docs/11-riferimenti.md) | fonti e scelte progettuali |
+| [12 Osservare il self-play](docs/12-osservare-il-self-play.md) | guardare l'addestramento mentre avviene |
 
 ## Test
 

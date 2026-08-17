@@ -121,6 +121,33 @@ class SelfPlayConfig:
 
 
 @dataclass
+class InferenceConfig:
+    """One GPU serving the whole self-play pool, instead of a model per worker.
+
+    A single worker never has more than ``search.max_batch_size`` leaves in
+    flight, which is far too few to fill a GPU; merging every worker's leaves
+    into one forward pass is what makes the GPU worth using at all. See
+    ``app.engine.inference`` for the measurements behind the defaults.
+    """
+
+    enabled: bool = False
+    """Off in the dataclass default so a bare ``RunConfig`` keeps the simple
+    per-worker path; the presets turn it on."""
+
+    device: str = "auto"
+    """``auto`` falls back to per-worker CPU evaluators when there is no GPU."""
+
+    max_batch: int = 256
+    collect_timeout_ms: float = 2.0
+    """How long the server waits for more workers' requests before running the
+    batch. Long enough to gather the pool, short enough not to add latency."""
+
+    use_amp: bool = False
+    """fp16 measured as noise on small networks (kernel-launch bound); worth
+    revisiting on larger towers."""
+
+
+@dataclass
 class TrainConfig:
     iterations: int = 100
     batch_size: int = 256
@@ -136,6 +163,22 @@ class TrainConfig:
     value_loss_weight: float = 1.0
     policy_loss_weight: float = 1.0
     grad_clip: float = 2.0
+
+    value_search_weight: float = 0.0
+    """Share of the value target taken from the search value ``q`` at that
+    position instead of the final game result ``z``::
+
+        target = (1 - w) * z + w * q
+
+    ``z`` is one very noisy sample: a single outcome pinned onto every position of
+    the game, all of them highly correlated. ``q`` is what the tree actually
+    concluded about *that* position, so mixing it in cuts the variance of the
+    value target sharply -- the network bootstraps off its own search, not off
+    human chess knowledge. ``0.0`` is the original AlphaZero target and stays the
+    dataclass default for backwards compatibility; the presets ship ``0.5``.
+
+    Ignored when ``search.simulations == 1``: with no search, ``q`` *is* the value
+    head's own output, and regressing it onto itself teaches nothing."""
 
     replay_buffer_size: int = 200_000
     min_buffer_before_training: int = 4_000
@@ -182,6 +225,7 @@ class RunConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     selfplay: SelfPlayConfig = field(default_factory=SelfPlayConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     arena: ArenaConfig = field(default_factory=ArenaConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
@@ -205,6 +249,7 @@ class RunConfig:
             network=_merge(NetworkConfig, base.network, payload.get("network")),
             search=_merge(SearchConfig, base.search, payload.get("search")),
             selfplay=_merge(SelfPlayConfig, base.selfplay, payload.get("selfplay")),
+            inference=_merge(InferenceConfig, base.inference, payload.get("inference")),
             train=_merge(TrainConfig, base.train, payload.get("train")),
             arena=_merge(ArenaConfig, base.arena, payload.get("arena")),
             benchmark=_merge(BenchmarkConfig, base.benchmark, payload.get("benchmark")),
@@ -230,47 +275,58 @@ def _merge(dataclass_type, current, overrides: Optional[Dict[str, Any]]):
 PRESETS: Dict[str, Dict[str, Any]] = {
     "tiny": {
         "name": "tiny",
+        "inference": {"enabled": False, "max_batch": 128},
         "network": {"history_length": 2, "residual_blocks": 3, "filters": 64},
         "search": {"simulations": 32},
         "selfplay": {"games_per_iteration": 20, "workers": 6, "max_game_plies": 160},
         "train": {"steps_per_iteration": 150, "batch_size": 128,
-                  "min_buffer_before_training": 1500, "replay_buffer_size": 60_000},
+                  "min_buffer_before_training": 1500, "replay_buffer_size": 60_000,
+                  "value_search_weight": 0.5},
         "arena": {"games": 12, "simulations": 32},
     },
     "small": {
         "name": "small",
+        "inference": {"enabled": False, "max_batch": 256},
         "network": {"history_length": 4, "residual_blocks": 6, "filters": 96},
         "search": {"simulations": 96},
         "selfplay": {"games_per_iteration": 40, "workers": 8, "max_game_plies": 240},
         "train": {"steps_per_iteration": 400, "batch_size": 256,
-                  "min_buffer_before_training": 4_000, "replay_buffer_size": 200_000},
+                  "min_buffer_before_training": 4_000, "replay_buffer_size": 200_000,
+                  "value_search_weight": 0.5},
         "arena": {"games": 20, "simulations": 96},
     },
     "medium": {
         "name": "medium",
+        "inference": {"enabled": False, "max_batch": 512},
         "network": {"history_length": 8, "residual_blocks": 10, "filters": 128},
         "search": {"simulations": 200},
         "selfplay": {"games_per_iteration": 80, "workers": 10, "max_game_plies": 300},
         "train": {"steps_per_iteration": 800, "batch_size": 512,
-                  "min_buffer_before_training": 20_000, "replay_buffer_size": 600_000},
+                  "min_buffer_before_training": 20_000, "replay_buffer_size": 600_000,
+                  "value_search_weight": 0.5},
         "arena": {"games": 30, "simulations": 200},
     },
     "large": {
         "name": "large",
+        "inference": {"enabled": False, "max_batch": 512},
         "network": {"history_length": 8, "residual_blocks": 20, "filters": 256},
         "search": {"simulations": 400},
         "selfplay": {"games_per_iteration": 160, "workers": 12, "max_game_plies": 340},
         "train": {"steps_per_iteration": 1500, "batch_size": 512,
-                  "min_buffer_before_training": 50_000, "replay_buffer_size": 1_500_000},
+                  "min_buffer_before_training": 50_000, "replay_buffer_size": 1_500_000,
+                  "value_search_weight": 0.5},
         "arena": {"games": 40, "simulations": 400},
     },
     "policy-only": {
         "name": "policy-only",
+        "inference": {"enabled": False, "max_batch": 512},
         "network": {"history_length": 4, "residual_blocks": 6, "filters": 96},
         "search": {"simulations": 1, "dirichlet_epsilon": 0.35, "temperature_moves": 30},
         "selfplay": {"games_per_iteration": 400, "workers": 10, "max_game_plies": 200},
+        # No search means no independent q to mix in: the target stays pure z.
         "train": {"steps_per_iteration": 600, "batch_size": 256,
-                  "min_buffer_before_training": 8_000, "replay_buffer_size": 300_000},
+                  "min_buffer_before_training": 8_000, "replay_buffer_size": 300_000,
+                  "value_search_weight": 0.0},
         "arena": {"games": 60, "simulations": 1},
     },
 }

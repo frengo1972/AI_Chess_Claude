@@ -98,6 +98,19 @@ Vedi [l'isolamento](08-isolamento-stockfish.md) per la motivazione.
 | `GET` | `/api/training/games?run_id=…` | PGN di partite di esempio |
 | `GET` | `/api/training/runs` | elenco dei run |
 | `WS` | `/api/training/ws` | push dello stato ogni 1,5 s |
+| `GET` | `/api/training/watch?run_id=…` | partite di self-play in corso, una per worker |
+| `POST` | `/api/training/watch/settings` | attiva/disattiva la pubblicazione e la pausa fra le mosse |
+| `WS` | `/api/training/watch/ws` | push delle scacchiere (cadenza in `interval_ms`, default 500 ms) |
+
+### `POST /api/training/watch/settings`
+
+```json
+{ "run_id": null, "enabled": true, "move_delay_ms": 500 }
+```
+
+Entrambi i campi sono opzionali: quello omesso resta com'è. Ha effetto entro mezzo
+secondo sul run già in corso, senza riavviarlo. Dettagli in
+[Osservare il self-play](12-osservare-il-self-play.md).
 
 ## Benchmark
 

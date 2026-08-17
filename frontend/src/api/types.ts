@@ -156,7 +156,22 @@ export interface IterationRow {
   promoted: number | null
   benchmark_elo: number | null
   benchmark_score: number | null
+  value_gap: number | null
+  wall_seconds: number | null
   extra: Record<string, unknown>
+}
+
+/** What a stopped run would pick up from, written by the trainer every iteration. */
+export interface SavedRunState {
+  run_id?: string
+  iteration?: number
+  games_total?: number
+  positions_total?: number
+  elo?: number
+  wall_seconds?: number
+  sessions?: number
+  device?: string
+  updated_at?: number
 }
 
 export interface TrainingRun {
@@ -169,11 +184,17 @@ export interface TrainingRun {
   config: Record<string, any>
   network: Record<string, any>
   notes: string
+  resumable?: boolean
+  has_trainer_state?: boolean
+  saved_state?: SavedRunState | null
 }
 
 export interface TrainingStatus {
   active: boolean
   process_alive?: boolean
+  /** Marked running, but nothing has updated the run for a long time. */
+  stale?: boolean
+  status_age_seconds?: number | null
   run: TrainingRun | null
   phase: string
   live?: Record<string, any>
