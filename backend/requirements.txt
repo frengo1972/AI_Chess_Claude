@@ -1,0 +1,19 @@
+# Core web layer
+fastapi==0.121.2
+uvicorn[standard]==0.41.0
+pydantic==2.13.1
+pydantic-settings==2.13.0
+python-multipart==0.0.20
+
+# Chess domain: legal move generation, FEN/PGN, UCI engine protocol
+chess==1.11.2
+
+# Numerics
+numpy==2.3.4
+
+# torch is installed separately (CUDA build) -- see scripts/setup.ps1
+# torch==2.13.0+cu130
+
+# Dev / test
+pytest==8.4.2
+httpx==0.28.1

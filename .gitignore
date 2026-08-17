@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+backend/.venv/
+backend/data/
+backend/checkpoints/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+*.local
+
+# Third-party binaries and artwork fetched by scripts/download_assets.py
+engines/
+frontend/public/pieces/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
