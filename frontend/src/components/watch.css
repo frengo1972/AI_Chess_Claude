@@ -1,0 +1,159 @@
+/*
+ * Live self-play boards. The tiles are deliberately small and dense: the point
+ * is to see several games at once and catch the shape of the play, not to
+ * analyse one position.
+ */
+
+.watch__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.watch__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 16px;
+}
+
+.watch__switch {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  padding-bottom: 5px;
+}
+
+.watch__switch input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.watch__note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  max-width: 96ch;
+}
+
+.watch__empty {
+  margin: 12px 0 0;
+  font-size: 12px;
+}
+
+.watch__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.watch__grid[data-count='1'] {
+  grid-template-columns: minmax(0, 420px);
+}
+
+.watch__grid[data-count='2'] {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.watch__tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  min-width: 0;
+}
+
+.watch__tile--stale {
+  opacity: 0.55;
+}
+
+.watch__tilehead,
+.watch__tilefoot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.watch__tilefoot {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.watch__slot {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+/* The board sizes itself to its container, so the container owns the aspect. */
+.watch__board {
+  aspect-ratio: 1;
+  width: 100%;
+  min-width: 0;
+}
+
+.watch__board .board-wrap {
+  padding: 0;
+}
+
+.watch__board .board {
+  box-shadow: 0 0 0 1px var(--board-frame);
+}
+
+.watch__meter {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* Black on the left, White on the right: the fill is White's share. */
+.watch__metertrack {
+  position: relative;
+  flex: 1;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #2b2a27;
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+
+.watch__meterfill {
+  position: absolute;
+  inset: 0 0 0 auto;
+  background: #f2efe6;
+  transition: width 280ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.watch__metermid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: rgba(137, 135, 129, 0.7);
+}
+
+.watch__metervalue {
+  flex: 0 0 auto;
+  width: 40px;
+  text-align: right;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.watch__result {
+  font-weight: 650;
+  color: var(--success-text);
+}

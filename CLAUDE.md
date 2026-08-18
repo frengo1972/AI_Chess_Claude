@@ -61,6 +61,18 @@ above `arena.win_threshold` against the current champion; a rejected candidate i
 back (model reloaded from `best.pt`, optimizer rebuilt) so the next self-play uses the
 champion.
 
+Runs are meant to span many sessions. `_persist_state` writes `state.json` (counters, Elo,
+cumulative wall time, session count) and `trainer.pt` (optimizer moments, LR schedule
+position, RNG state) on **every** iteration including data-collection-only ones — resuming
+without those silently restarts AdamW, resets the learning rate and replays the same
+self-play seeds. `--resume --run-id X` re-reads the run's own `config.json`; a resume
+whose `trainer.pt` is missing or unreadable degrades to weights-only and logs a warning.
+
+Value target is `(1 - w) * z + w * q_root` with `w = train.value_search_weight`
+([_value_targets](backend/app/engine/selfplay.py)), forced to 0 when `simulations == 1`
+(no tree ⇒ `q` is the value head's own output). Handcrafted position features must never
+enter this target — see the reasoning in [docs/06](docs/06-apprendimento.md).
+
 Module roles:
 
 | module | responsibility |
@@ -73,6 +85,8 @@ Module roles:
 | [replay.py](backend/app/engine/replay.py) | bit-packed samples (~30× smaller than raw planes); `.npz` shards per iteration. |
 | [selfplay.py](backend/app/engine/selfplay.py) | `ProcessPoolExecutor` workers; workers get a *checkpoint path*, not a live model (Windows `spawn`, no CUDA across processes). |
 | [arena.py](backend/app/engine/arena.py) | gating matches + Elo conversion. |
+| [watch.py](backend/app/engine/watch.py) | one-way tap: workers publish the game in progress to `<run>/watch/slot-NN.json` for the UI. Off by default; settings file polled by workers so it toggles mid-run. Never read back into training. |
+| [inference.py](backend/app/engine/inference.py) | optional shared-GPU server: workers become clients instead of owning a model. **Off by default — measured 0.84x–1.55x, not the win the raw throughput suggests**; the docstring's table says why (one request in flight per worker, 18.7 KB policy per answer). Don't re-derive it, extend it: concurrent games per worker + legal-move-only answers. |
 
 `PositionHistory` (not a bare FEN) is the unit passed around — repetition counters and the
 last `T` plies must match what training saw. This is why `GameSession` stores the move list
@@ -95,7 +109,11 @@ and `choose_move` replays it.
   two sides talk through the filesystem and SQLite: trainer writes `status.json` and
   iteration rows; stopping is cooperative via a `stop.flag` file.
 * [store/metrics.py](backend/app/store/metrics.py) — SQLite (WAL) at
-  `backend/data/training.db`: runs, iterations, events, sample games.
+  `backend/data/training.db`: runs, iterations, events, sample games. Adding a KPI means
+  adding it to `SCHEMA` *and* `ITERATION_COLUMNS`; `_add_missing_columns` then ALTERs
+  existing databases on open, since `CREATE TABLE IF NOT EXISTS` would leave them stale
+  and every insert would fail. `create_run` upserts so a resumed run keeps its
+  `created_at` and original preset.
 * API split by concern and routed under `/api`: `game`, `analysis`, `training`, `models`,
   `docs`. `routes_game` drives the neural engine, `routes_analysis` drives Stockfish; they
   share no code path. Reference: [docs/09-api.md](docs/09-api.md).

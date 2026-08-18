@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import LineChart, { type Series } from '../components/charts'
 import { Panel, Stat } from '../components/panels'
+import SelfPlayWatch from '../components/SelfPlayWatch'
 import * as api from '../api/client'
 import type {
   IterationRow,
   PresetInfo,
   TrainingRun,
   TrainingStatus,
+  WatchSettings,
 } from '../api/types'
 import './training.css'
 
@@ -34,6 +36,9 @@ export default function TrainingPage() {
   const [events, setEvents] = useState<Array<{ timestamp: number; level: string; message: string }>>([])
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // Kept here only so a run started from this page inherits what the watch
+  // panel is set to; the panel itself owns the live state.
+  const watchSettings = useRef<WatchSettings>({ enabled: false, move_delay_ms: 0 })
 
   const [form, setForm] = useState({
     preset: 'small',
@@ -101,8 +106,33 @@ export default function TrainingPage() {
         games_per_iteration: form.games || undefined,
         simulations: form.simulations || undefined,
         workers: form.workers || undefined,
+        overrides: {
+          selfplay: {
+            watch_enabled: watchSettings.current.enabled,
+            watch_move_delay_ms: watchSettings.current.move_delay_ms,
+          },
+        },
       })
       setSelectedRun(response.run_id)
+      await refreshRuns()
+    } catch (cause) {
+      setError(String((cause as Error).message))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Continue an existing network instead of starting a new one from scratch. */
+  const resume = async () => {
+    if (!run) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.startTraining({
+        preset: run.preset ?? form.preset,
+        resume_run_id: run.id,
+        iterations: form.iterations || undefined,
+      })
       await refreshRuns()
     } catch (cause) {
       setError(String((cause as Error).message))
@@ -138,6 +168,10 @@ export default function TrainingPage() {
   const run = status?.run ?? runs.find((item) => item.id === selectedRun) ?? null
   const network = (run?.network ?? {}) as Record<string, number>
   const isActive = status?.active && status.run?.id === selectedRun
+  // A run whose trainer died still says "running"; resuming it is exactly what
+  // you want to do, so the button follows the process rather than the row.
+  const stale = Boolean(status?.stale && status.run?.id === selectedRun)
+  const canResume = Boolean(run?.resumable) && (!isActive || stale)
 
   const series = (name: string, key: keyof IterationRow, colour: string): Series => ({
     name,
@@ -206,11 +240,24 @@ export default function TrainingPage() {
         />
         <Stat label="Replay buffer" value={formatCount(last?.buffer_size ?? 0)} hint="posizioni in memoria" />
         <Stat
+          label="Tempo di calcolo"
+          value={formatHours(last?.wall_seconds ?? 0)}
+          hint={`${asNumber(last?.extra?.sessions) ?? 1} sessioni`}
+        />
+        <Stat
           label="Throughput"
           value={last?.games_per_minute ? `${last.games_per_minute.toFixed(1)}/min` : '—'}
           hint="partite di self-play"
         />
       </section>
+
+      {/* ------------------------------------------------- live self-play */}
+      <SelfPlayWatch
+        runId={selectedRun}
+        onSettings={(settings) => {
+          watchSettings.current = settings
+        }}
+      />
 
       {/* --------------------------------------------------------- charts */}
       <section className="training__charts">
@@ -242,9 +289,16 @@ export default function TrainingPage() {
         />
         <LineChart
           title="Value loss"
-          subtitle="MSE vs risultato finale"
+          subtitle="MSE vs bersaglio value"
           labels={labels}
           series={[series('value', 'value_loss', 'var(--series-2)')]}
+          format={(value) => value.toFixed(3)}
+        />
+        <LineChart
+          title="Scarto ricerca / risultato"
+          subtitle="media di |z − q|: quanto la ricerca sbaglia previsione"
+          labels={labels}
+          series={[series('|z − q|', 'value_gap', 'var(--series-3)')]}
           format={(value) => value.toFixed(3)}
         />
         <LineChart
@@ -393,6 +447,61 @@ export default function TrainingPage() {
                 Stop richiesto: il trainer esce alla fine dell’iterazione corrente.
               </p>
             )}
+
+            {run?.resumable && (
+              <div className="training__resume">
+                <p className="training__resumelead">
+                  <strong>Riprendi</strong> continua questa rete da dove si era fermata —
+                  pesi, ottimizzatore, learning rate, replay buffer ed Elo accumulato.
+                </p>
+                <dl className="training__resumefacts">
+                  <div>
+                    <dt>Iterazione</dt>
+                    <dd className="numeric">{run.saved_state?.iteration ?? 0}</dd>
+                  </div>
+                  <div>
+                    <dt>Partite</dt>
+                    <dd className="numeric">
+                      {formatCount(run.saved_state?.games_total ?? 0)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Elo</dt>
+                    <dd className="numeric">
+                      {Math.round(run.saved_state?.elo ?? 0)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Calcolo</dt>
+                    <dd className="numeric">
+                      {formatHours(run.saved_state?.wall_seconds ?? 0)}
+                    </dd>
+                  </div>
+                </dl>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={busy || !canResume}
+                  onClick={() => void resume()}
+                >
+                  Riprendi{form.iterations ? ` (+${form.iterations} iterazioni)` : ''}
+                </button>
+                {stale && (
+                  <p className="muted" style={{ margin: 0, fontSize: 11 }}>
+                    Il run risulta “in corso” ma non dà segni di vita da{' '}
+                    {formatMinutes(status?.status_age_seconds)}: il processo è
+                    probabilmente terminato. Assicurati che non sia davvero attivo prima
+                    di riprenderlo.
+                  </p>
+                )}
+                {run.has_trainer_state === false && (
+                  <p className="muted" style={{ margin: 0, fontSize: 11 }}>
+                    Nessuno stato dell’ottimizzatore salvato (run precedente a questa
+                    funzione): riprenderà dai pesi, ricostruendo i momenti di AdamW.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </Panel>
 
@@ -439,6 +548,22 @@ export default function TrainingPage() {
   )
 }
 
+function formatHours(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—'
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`
+  return `${(seconds / 3600).toFixed(1)} h`
+}
+
+function formatMinutes(seconds: number | null | undefined): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return 'un po’'
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`
+  return `${(seconds / 3600).toFixed(1)} h`
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
 function formatCount(value: number): string {
   if (!Number.isFinite(value)) return '—'
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)} M`
@@ -460,6 +585,7 @@ const CONFIG_KEYS: Array<[string, string]> = [
   ['train.steps_per_iteration', 'step/iterazione'],
   ['train.learning_rate', 'learning rate'],
   ['train.optimizer', 'ottimizzatore'],
+  ['train.value_search_weight', 'peso ricerca nel value'],
   ['train.replay_buffer_size', 'replay buffer'],
   ['arena.games', 'partite arena'],
   ['arena.win_threshold', 'soglia promozione'],

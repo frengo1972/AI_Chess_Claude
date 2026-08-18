@@ -183,3 +183,30 @@
   text-decoration: underline;
   cursor: pointer;
 }
+
+.docs__mermaid {
+  margin: 0 0 16px;
+  padding: 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  display: flex;
+  justify-content: center;
+}
+
+.docs__mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.docs__mermaid--error {
+  display: block;
+  color: var(--status-critical);
+  font-size: 13px;
+}
+
+.docs__mermaid--error pre {
+  margin-top: 8px;
+  white-space: pre-wrap;
+}

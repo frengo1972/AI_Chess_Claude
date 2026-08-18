@@ -11,6 +11,7 @@ dall'API. La dashboard si aggiorna via WebSocket ogni 1,5 secondi.
 | **Partite giocate** | totale cumulativo di partite di self-play | cresce; è il vero "carburante" dell'apprendimento |
 | **Posizioni** | totale di esempi di training generati | ~40-120 per partita |
 | **Replay buffer** | posizioni attualmente in memoria | si stabilizza sulla capacità configurata |
+| **Tempo di calcolo** | ore di addestramento accumulate, sommate su tutte le sessioni | cresce anche dopo un'interruzione: il run riprende, non riparte |
 
 ## Indicatori di forza
 
@@ -30,7 +31,8 @@ cui **le singole misure vanno lette come tendenza, non come verità**.
 | KPI | Significato | Cosa vuoi vedere |
 |---|---|---|
 | **Policy loss** | cross-entropy fra rete e visite MCTS | scende, poi si stabilizza. Parte da ~ln(35) ≈ 3,5-6,5 |
-| **Value loss** | MSE fra valore previsto e risultato | scende da ~1,0 verso 0,6-0,8. Sotto 0,3 con poche partite = overfitting |
+| **Value loss** | MSE fra valore previsto e bersaglio value | scende da ~1,0 verso 0,6-0,8. Sotto 0,3 con poche partite = overfitting. Con `value_search_weight > 0` parte più bassa: il bersaglio è meno rumoroso |
+| **Scarto ricerca / risultato** | media di \|z − q\|: quanto la ricerca si sbagliava sull'esito | scende. È la misura di quanto la rete sta imparando a *valutare*, non solo a giocare |
 | **Learning rate** | passo dell'ottimizzatore | scalini in corrispondenza delle milestone |
 | **Entropia della policy** | quanto è "indecisa" la ricerca | deve scendere lentamente. Un crollo rapido = collasso, la rete gioca sempre le stesse mosse |
 

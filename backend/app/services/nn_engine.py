@@ -24,6 +24,9 @@ from app.engine.network import ChessNet, load_checkpoint, resolve_device
 
 UNTRAINED_ID = "untrained"
 
+_NOT_A_MODEL = {"candidate", "trainer"}
+"""Stems inside a run directory that are not playable networks."""
+
 
 @dataclass
 class ModelInfo:
@@ -73,8 +76,10 @@ class NeuralEngineService:
             if not run_directory.is_dir():
                 continue
             for checkpoint in sorted(run_directory.glob("*.pt")):
-                # "candidate" is a transient artefact of the gating step.
-                if checkpoint.stem == "candidate":
+                # Not every ``.pt`` in a run directory is a playable network:
+                # "candidate" is a transient artefact of the gating step, and
+                # "trainer" holds the optimiser state that lets a run resume.
+                if checkpoint.stem in _NOT_A_MODEL:
                     continue
                 info = self._describe(checkpoint, run_directory.name)
                 if info:
@@ -94,7 +99,9 @@ class NeuralEngineService:
             payload = torch.load(path, map_location="cpu", weights_only=False)
         except Exception:  # noqa: BLE001 - a half-written checkpoint must not 500
             return None
-        network_config = NetworkConfig(**payload["network_config"])
+        if not isinstance(payload, dict) or "state_dict" not in payload:
+            return None  # some other kind of .pt: not a network, not our business
+        network_config = NetworkConfig(**payload.get("network_config", {}))
         state_dict = payload["state_dict"]
         parameters = sum(tensor.numel() for tensor in state_dict.values())
         size_bytes = sum(

@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
+import type { ReactElement } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import * as api from '../api/client'
 import type { DocSummary } from '../api/types'
+import MermaidDiagram from '../components/MermaidDiagram'
 import './docs.css'
 
 export default function DocsPage() {
@@ -57,6 +59,21 @@ export default function DocsPage() {
             <Markdown
               remarkPlugins={[remarkGfm]}
               components={{
+                pre: ({ children }) => {
+                  // Fenced ```mermaid blocks become live diagrams; everything
+                  // else keeps the normal <pre><code> rendering.
+                  const child = children as ReactElement<{
+                    className?: string
+                    children?: unknown
+                  }>
+                  const className = child?.props?.className ?? ''
+                  const language = /language-(\w+)/.exec(className)?.[1]
+                  if (language === 'mermaid') {
+                    const code = String(child.props.children ?? '').replace(/\n$/, '')
+                    return <MermaidDiagram chart={code} />
+                  }
+                  return <pre>{children}</pre>
+                },
                 a: ({ href, children }) => {
                   // Cross-links between documents stay inside the app.
                   const internal = href?.endsWith('.md')

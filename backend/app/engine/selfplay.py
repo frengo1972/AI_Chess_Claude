@@ -33,9 +33,10 @@ import numpy as np
 
 from app.config import RunConfig
 from app.engine.encoding import PositionHistory
-from app.engine.evaluator import Evaluator
+from app.engine.evaluator import BaseEvaluator, Evaluator
+from app.engine.inference import InferenceServer, worker_evaluator, worker_initializer
 from app.engine.mcts import MCTS
-from app.engine.network import load_checkpoint
+from app.engine.network import load_checkpoint, resolve_device
 from app.engine.replay import Sample, make_sample
 from app.engine.rules import result_string, terminal_state
 from app.engine.watch import WatchPublisher
@@ -52,12 +53,17 @@ class GameRecord:
     duration_seconds: float = 0.0
     mean_root_value: float = 0.0
     mean_policy_entropy: float = 0.0
+    mean_value_gap: float = 0.0
+    """Mean |z - q|: how much the search disagreed with the eventual result.
+    High and falling is the signature of a value head that is learning."""
 
 
 @dataclass
 class SelfPlayBatch:
     games: List[GameRecord] = field(default_factory=list)
     duration_seconds: float = 0.0
+    inference: Optional[Dict[str, float]] = None
+    """Shared-GPU server statistics, when one was used."""
 
     @property
     def positions(self) -> int:
@@ -82,6 +88,7 @@ class SelfPlayBatch:
             "avg_policy_entropy": float(
                 np.mean([g.mean_policy_entropy for g in self.games])
             ),
+            "avg_value_gap": float(np.mean([g.mean_value_gap for g in self.games])),
             "duration_seconds": self.duration_seconds,
             "games_per_minute": (
                 len(self.games) / (self.duration_seconds / 60.0)
@@ -97,7 +104,7 @@ class SelfPlayBatch:
 
 
 def play_game(
-    evaluator: Evaluator,
+    evaluator: BaseEvaluator,
     config: RunConfig,
     rng: np.random.Generator,
     *,
@@ -200,14 +207,13 @@ def play_game(
         result = "1/2-1/2"
 
     white_score = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}[result]
+    outcomes = [
+        white_score if turn == chess.WHITE else -white_score for turn in turn_log
+    ]
+    targets = _value_targets(outcomes, root_values, config)
     record.samples = [
-        make_sample(
-            planes,
-            policy,
-            white_score if turn == chess.WHITE else -white_score,
-            history_length,
-        )
-        for planes, policy, turn in zip(planes_log, policy_log, turn_log)
+        make_sample(planes, policy, target, history_length)
+        for planes, policy, target in zip(planes_log, policy_log, targets)
     ]
     record.result = result
     record.termination = termination_reason
@@ -216,6 +222,11 @@ def play_game(
     record.duration_seconds = time.perf_counter() - started
     record.mean_root_value = float(np.mean(root_values)) if root_values else 0.0
     record.mean_policy_entropy = float(np.mean(entropies)) if entropies else 0.0
+    record.mean_value_gap = (
+        float(np.mean(np.abs(np.asarray(outcomes) - np.asarray(root_values))))
+        if root_values
+        else 0.0
+    )
 
     if watch is not None:
         watch.end(
@@ -225,6 +236,32 @@ def play_game(
             resigned=record.resigned,
         )
     return record
+
+
+def _value_targets(
+    outcomes: List[float], root_values: List[float], config: RunConfig
+) -> List[float]:
+    """Blend the game result with what the search thought of each position.
+
+    ``z`` alone is a single Bernoulli-ish draw stamped onto every position of the
+    game: unbiased, but so noisy and so correlated that the value head spends its
+    early capacity fitting the outcome of *games* rather than the merit of
+    *positions*. ``q`` -- the root value the tree settled on -- is a much
+    lower-variance opinion about this position specifically, and it comes from the
+    network's own search, so nothing external enters the target.
+
+    With ``simulations == 1`` there is no tree: ``q`` is the value head's raw
+    output and mixing it in would regress the head onto itself, so the weight is
+    ignored.
+    """
+    weight = float(config.train.value_search_weight)
+    if weight <= 0.0 or config.search.simulations <= 1:
+        return outcomes
+    weight = min(weight, 1.0)
+    return [
+        (1.0 - weight) * outcome + weight * value
+        for outcome, value in zip(outcomes, root_values)
+    ]
 
 
 def _entropy(distribution: Dict[int, float]) -> float:
@@ -270,7 +307,10 @@ def _worker_evaluator(checkpoint: str, device: str, threads: int) -> Evaluator:
 
 def _worker_play(payload: Dict[str, Any]) -> List[GameRecord]:
     config = RunConfig.from_dict(payload["config"])
-    evaluator = _worker_evaluator(
+    # A worker that has been handed a line to the shared GPU owns no model at
+    # all -- which also saves deserialising the checkpoint once per worker per
+    # iteration.
+    evaluator: BaseEvaluator = worker_evaluator() or _worker_evaluator(
         payload["checkpoint"],
         config.selfplay.device,
         config.selfplay.torch_threads_per_worker,
@@ -356,15 +396,61 @@ def generate_selfplay(
         import multiprocessing as mp
 
         context = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
-            futures = [pool.submit(_worker_play, payload) for payload in payloads]
-            for future in as_completed(futures):
-                batch.games.extend(future.result())
-                if progress:
-                    progress(len(batch.games), total_games)
+        server = _start_inference_server(checkpoint, config, workers, context)
+        initializer = None
+        initargs: Tuple = ()
+        if server is not None:
+            initializer = worker_initializer
+            initargs = (server.requests, server.responses, server.counter)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=context,
+                initializer=initializer,
+                initargs=initargs,
+            ) as pool:
+                futures = [pool.submit(_worker_play, payload) for payload in payloads]
+                for future in as_completed(futures):
+                    batch.games.extend(future.result())
+                    if progress:
+                        progress(len(batch.games), total_games)
+        finally:
+            if server is not None:
+                batch.inference = server.stop().to_dict()
 
     batch.duration_seconds = time.perf_counter() - started
     return batch
+
+
+def _start_inference_server(
+    checkpoint: Path, config: RunConfig, workers: int, context
+) -> Optional[InferenceServer]:
+    """Bring up the shared GPU, or return ``None`` and let workers use their own.
+
+    Falling back is deliberate: a machine without a GPU, or a checkpoint that
+    will not load, must still be able to generate self-play -- just slower.
+    """
+    if not config.inference.enabled:
+        return None
+    device = resolve_device(config.inference.device)
+    if device == "cpu":
+        # Sharing one CPU model between workers would serialise them behind a
+        # single core; the per-worker path is strictly better there.
+        return None
+    try:
+        server = InferenceServer(
+            checkpoint,
+            device=device,
+            max_batch=config.inference.max_batch,
+            collect_timeout_ms=config.inference.collect_timeout_ms,
+            use_amp=config.inference.use_amp,
+            request_queue=context.Queue(),
+            response_queues=[context.Queue() for _ in range(workers)],
+            counter=context.Value("i", 0),
+        )
+        return server.start()
+    except Exception:  # noqa: BLE001 - never let inference kill a training run
+        return None
 
 
 def _split_evenly(total: int, parts: int) -> List[int]:
