@@ -114,6 +114,10 @@ cd backend
 python -m pytest -q
 ```
 
+## Licenza
+
+MIT — vedi [LICENSE](LICENSE).
+
 ## Licenze di terze parti
 
 * **Stockfish** — GPL-3.0, scaricato in `engines/` (non ridistribuito).
