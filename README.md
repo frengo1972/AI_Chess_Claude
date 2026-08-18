@@ -105,6 +105,7 @@ Dettagli in [`docs/08-isolamento-stockfish.md`](docs/08-isolamento-stockfish.md)
 | [10 Avvio](docs/10-avvio.md) | installazione, uso, problemi frequenti |
 | [11 Riferimenti](docs/11-riferimenti.md) | fonti e scelte progettuali |
 | [12 Osservare il self-play](docs/12-osservare-il-self-play.md) | guardare l'addestramento mentre avviene |
+| [13 Guida didattica MCTS + rete](docs/13-guida-montecarlo-e-rete.md) | percorso introduttivo con diagrammi e video, per chi parte da zero |
 
 ## Test
 
